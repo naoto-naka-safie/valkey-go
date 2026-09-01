@@ -11410,3 +11410,69 @@ func clusterClientWithConnCount(n int) *clusterClient {
 	}
 	return &clusterClient{conns: conns}
 }
+
+func TestClusterClientRefreshClosesConnAddedWhileUnlocked(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+
+	// A MOVED redirection can insert a conn into c.conns while _refresh has
+	// released the read lock. _refresh must close it instead of just dropping it.
+	const redirected = "127.0.0.9:9"
+
+	var clientp atomic.Pointer[clusterClient]
+	var once sync.Once
+	closedCh := make(chan string, 8)
+
+	client, err := newClusterClient(
+		&ClientOption{
+			InitAddress:         []string{"127.0.0.1:0"},
+			SendToReplicas:      func(cmd Completed) bool { return false },
+			EnableReplicaAZInfo: true,
+		},
+		func(dst string, opt *ClientOption) conn {
+			return &mockConn{
+				DoFn:   func(cmd Completed) ValkeyResult { return slotsResp },
+				AddrFn: func() string { return dst },
+				AZFn: func() string {
+					// AZ() is called after _refresh released the read lock and
+					// before it takes the write lock, so redirect here.
+					if c := clientp.Load(); c != nil {
+						once.Do(func() { c.redirectOrNew(redirected, nil, 0, RedirectMove) })
+					}
+					return "us-west-1a"
+				},
+				CloseFn: func() { closedCh <- dst },
+			}
+		},
+		newRetryer(defaultRetryDelayFn),
+	)
+	if err != nil {
+		t.Fatalf("unexpected err %v", err)
+	}
+	defer client.Close()
+
+	clientp.Store(client)
+
+	if err := client.refresh(context.Background()); err != nil {
+		t.Fatalf("unexpected err %v", err)
+	}
+
+	client.mu.RLock()
+	_, ok := client.conns[redirected]
+	client.mu.RUnlock()
+	if ok {
+		t.Fatalf("%s should have been dropped from conns", redirected)
+	}
+
+	// removes are closed after a 5s delay
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case dst := <-closedCh:
+			if dst == redirected {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("%s was dropped from conns without being closed", redirected)
+		}
+	}
+}

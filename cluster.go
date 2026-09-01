@@ -257,15 +257,11 @@ func (c *clusterClient) _refresh() (err error) {
 		}
 	}
 
-	var removes []conn
-
 	c.mu.RLock()
 	for addr, cc := range c.conns {
 		if fresh, ok := conns[addr]; ok {
 			fresh.conn = cc.conn
 			conns[addr] = fresh
-		} else {
-			removes = append(removes, cc.conn)
 		}
 	}
 	c.mu.RUnlock()
@@ -340,7 +336,16 @@ func (c *clusterClient) _refresh() (err error) {
 		}
 	}
 
+	var removes []conn
+
 	c.mu.Lock()
+	// redirectOrNew may have changed c.conns while the lock was released above,
+	// so collect the removals here. Otherwise those conns are dropped without being closed.
+	for addr, cc := range c.conns {
+		if fresh, ok := conns[addr]; !ok || fresh.conn != cc.conn {
+			removes = append(removes, cc.conn)
+		}
+	}
 	c.wslots = wslots
 	c.rslots = rslots
 	c.conns = conns
