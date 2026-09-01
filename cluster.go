@@ -337,13 +337,40 @@ func (c *clusterClient) _refresh() (err error) {
 	}
 
 	var removes []conn
+	var replaced map[conn]conn
 
 	c.mu.Lock()
-	// redirectOrNew may have changed c.conns while the lock was released above,
-	// so collect the removals here. Otherwise those conns are dropped without being closed.
+	// redirectOrNew may have changed c.conns while the lock was released above.
+	// Reconcile here, otherwise the conns it added are dropped without being closed.
 	for addr, cc := range c.conns {
-		if fresh, ok := conns[addr]; !ok || fresh.conn != cc.conn {
+		fresh, ok := conns[addr]
+		if !ok {
 			removes = append(removes, cc.conn)
+			continue
+		}
+		if fresh.conn != cc.conn {
+			// redirectOrNew replaced the conn at this addr and already scheduled the
+			// one it replaced for closing, so keep the replacement and retarget the slots.
+			if replaced == nil {
+				replaced = make(map[conn]conn, 1)
+			}
+			replaced[fresh.conn] = cc.conn
+			fresh.conn = cc.conn
+			conns[addr] = fresh
+		}
+	}
+	if replaced != nil {
+		for i := range wslots {
+			if cc, ok := replaced[wslots[i]]; ok {
+				wslots[i] = cc
+			}
+		}
+		for _, nodes := range rslots {
+			for i := range nodes {
+				if cc, ok := replaced[nodes[i].conn]; ok {
+					nodes[i].conn = cc
+				}
+			}
 		}
 	}
 	c.wslots = wslots

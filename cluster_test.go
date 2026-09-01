@@ -11476,3 +11476,66 @@ func TestClusterClientRefreshClosesConnAddedWhileUnlocked(t *testing.T) {
 		}
 	}
 }
+
+func TestClusterClientRefreshKeepsConnReplacedWhileUnlocked(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+
+	// redirectOrNew can also replace the conn at an unchanged addr while _refresh
+	// has released the read lock. It schedules the conn it replaced for closing,
+	// so the replacement has to survive the refresh.
+	const master = "127.0.0.1:0"
+
+	var clientp atomic.Pointer[clusterClient]
+	var replacement atomic.Value
+	var once sync.Once
+
+	client, err := newClusterClient(
+		&ClientOption{
+			InitAddress:         []string{master},
+			SendToReplicas:      func(cmd Completed) bool { return false },
+			EnableReplicaAZInfo: true,
+		},
+		func(dst string, opt *ClientOption) conn {
+			return &mockConn{
+				DoFn:   func(cmd Completed) ValkeyResult { return slotsResp },
+				AddrFn: func() string { return dst },
+				AZFn: func() string {
+					if c := clientp.Load(); c != nil {
+						once.Do(func() {
+							replacement.Store(c.redirectOrNew(master, c._pick(0, false), 0, RedirectMove))
+						})
+					}
+					return "us-west-1a"
+				},
+			}
+		},
+		newRetryer(defaultRetryDelayFn),
+	)
+	if err != nil {
+		t.Fatalf("unexpected err %v", err)
+	}
+	defer client.Close()
+
+	clientp.Store(client)
+
+	if err := client.refresh(context.Background()); err != nil {
+		t.Fatalf("unexpected err %v", err)
+	}
+
+	want, _ := replacement.Load().(conn)
+	if want == nil {
+		t.Fatal("redirectOrNew was not called")
+	}
+
+	client.mu.RLock()
+	got := client.conns[master].conn
+	slot := client.wslots[0]
+	client.mu.RUnlock()
+
+	if got != want {
+		t.Fatalf("conns[%s] should hold the replacement conn", master)
+	}
+	if slot != want {
+		t.Fatal("wslots should point at the replacement conn")
+	}
+}
