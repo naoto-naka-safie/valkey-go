@@ -11539,3 +11539,117 @@ func TestClusterClientRefreshKeepsConnReplacedWhileUnlocked(t *testing.T) {
 		t.Fatal("wslots should point at the replacement conn")
 	}
 }
+
+var slotsRespWithExtraReplica = NewResult(slicemsg('*', []ValkeyMessage{
+	slicemsg('*', []ValkeyMessage{
+		{typ: ':', intlen: 0},
+		{typ: ':', intlen: 16383},
+		slicemsg('*', []ValkeyMessage{ // master
+			strmsg('+', "127.0.0.1"),
+			{typ: ':', intlen: 0},
+			strmsg('+', ""),
+		}),
+		slicemsg('*', []ValkeyMessage{ // replica
+			strmsg('+', "127.0.1.1"),
+			{typ: ':', intlen: 1},
+			strmsg('+', ""),
+		}),
+		slicemsg('*', []ValkeyMessage{ // replica that only appears on the second refresh
+			strmsg('+', "127.0.0.2"),
+			{typ: ':', intlen: 2},
+			strmsg('+', ""),
+		}),
+	}),
+}), nil)
+
+func TestClusterClientRefreshClosesConnConnectedByAZ(t *testing.T) {
+	defer ShouldNotLeak(SetupLeakDetection())
+
+	// For a node that only appears in the refreshed topology, _refresh carries a conn of
+	// its own and AZ() connects it. If redirectOrNew installs another conn at that addr
+	// while the lock is released, the connected one has to be closed, not just dropped.
+	const added = "127.0.0.2:2"
+
+	var clientp atomic.Pointer[clusterClient]
+	var once sync.Once
+	var extra atomic.Bool
+
+	var mu sync.Mutex
+	var madeForAdded []conn
+	closed := make(map[conn]bool)
+
+	client, err := newClusterClient(
+		&ClientOption{
+			InitAddress:         []string{"127.0.0.1:0"},
+			SendToReplicas:      func(cmd Completed) bool { return false },
+			EnableReplicaAZInfo: true,
+		},
+		func(dst string, opt *ClientOption) conn {
+			m := &mockConn{AddrFn: func() string { return dst }}
+			m.DoFn = func(cmd Completed) ValkeyResult {
+				if extra.Load() {
+					return slotsRespWithExtraReplica
+				}
+				return slotsResp
+			}
+			m.AZFn = func() string {
+				if dst == added {
+					if c := clientp.Load(); c != nil {
+						once.Do(func() { c.redirectOrNew(added, nil, 0, RedirectMove) })
+					}
+				}
+				return "us-west-1a"
+			}
+			m.CloseFn = func() {
+				mu.Lock()
+				closed[conn(m)] = true
+				mu.Unlock()
+			}
+			if dst == added {
+				mu.Lock()
+				madeForAdded = append(madeForAdded, conn(m))
+				mu.Unlock()
+			}
+			return m
+		},
+		newRetryer(defaultRetryDelayFn),
+	)
+	if err != nil {
+		t.Fatalf("unexpected err %v", err)
+	}
+	defer client.Close()
+
+	clientp.Store(client)
+	extra.Store(true)
+
+	if err := client.refresh(context.Background()); err != nil {
+		t.Fatalf("unexpected err %v", err)
+	}
+
+	mu.Lock()
+	made := append([]conn(nil), madeForAdded...)
+	mu.Unlock()
+	if len(made) < 2 {
+		t.Fatalf("expected _refresh and redirectOrNew to make a conn each for %s, got %d", added, len(made))
+	}
+
+	client.mu.RLock()
+	got := client.conns[added].conn
+	client.mu.RUnlock()
+	if got != made[len(made)-1] {
+		t.Fatalf("conns[%s] should hold the conn redirectOrNew installed", added)
+	}
+
+	// removes are closed after a 5s delay
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		done := closed[made[0]]
+		mu.Unlock()
+		if done {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("the conn AZ() connected was dropped without being closed")
+}

@@ -349,12 +349,13 @@ func (c *clusterClient) _refresh() (err error) {
 			continue
 		}
 		if fresh.conn != cc.conn {
-			// redirectOrNew replaced the conn at this addr and already scheduled the
-			// one it replaced for closing, so keep the replacement and retarget the slots.
+			// Keep the conn redirectOrNew installed here, and close fresh.conn since
+			// the AZ() calls above may have already connected it.
 			if replaced == nil {
 				replaced = make(map[conn]conn, 1)
 			}
 			replaced[fresh.conn] = cc.conn
+			removes = append(removes, fresh.conn)
 			fresh.conn = cc.conn
 			conns[addr] = fresh
 		}
