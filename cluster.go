@@ -360,16 +360,28 @@ func (c *clusterClient) _refresh() (err error) {
 			conns[addr] = fresh
 		}
 	}
-	if replaced != nil {
-		for i := range wslots {
-			if cc, ok := replaced[wslots[i]]; ok {
-				wslots[i] = cc
+	for _, g := range groups {
+		hit := false
+		for i := range g.nodes {
+			if _, ok := replaced[g.nodes[i].conn]; ok {
+				hit = true
+				break
 			}
 		}
-		for _, nodes := range rslots {
-			for i := range nodes {
-				if cc, ok := replaced[nodes[i].conn]; ok {
-					nodes[i].conn = cc
+		if !hit {
+			continue
+		}
+		for _, slot := range g.slots {
+			for i := slot[0]; i <= slot[1] && i >= 0 && i < 16384; i++ {
+				if cc, ok := replaced[wslots[i]]; ok {
+					wslots[i] = cc
+				}
+				if rslots != nil {
+					for j := range rslots[i] {
+						if cc, ok := replaced[rslots[i][j].conn]; ok {
+							rslots[i][j].conn = cc
+						}
+					}
 				}
 			}
 		}
